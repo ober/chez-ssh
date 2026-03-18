@@ -45,9 +45,9 @@
          (load-shared-object "./chez_ssh_shim.so")]
         [else (void)])))
 
-  ;; POSIX setenv/unsetenv (not in Chez's standard library)
-  (define c-setenv (foreign-procedure "setenv" (string string int) int))
-  (define c-unsetenv (foreign-procedure "unsetenv" (string) int))
+  ;; Use Chez's putenv for environment — ensures both Chez's getenv
+  ;; and child process environ see the change.
+  ;; POSIX setenv alone doesn't update Chez's cached env.
 
   ;; ---- FFI bindings ----
 
@@ -179,7 +179,7 @@
              ;; Set SSH_AUTH_SOCK for child processes
              (let ([path (c-get-socket-path)])
                (when (and path (not (string=? path "")))
-                 (c-setenv "SSH_AUTH_SOCK" path 1)))
+                 (putenv "SSH_AUTH_SOCK" path)))
              #t)
            (error 'ssh-agent-start
                   "Failed to start SSH agent")))]))
@@ -187,7 +187,7 @@
   (define (ssh-agent-stop)
     (c-stop)
     ;; Clear SSH_AUTH_SOCK
-    (c-unsetenv "SSH_AUTH_SOCK"))
+    (putenv "SSH_AUTH_SOCK" ""))
 
   (define (ssh-agent-running?)
     (= (c-is-running) 1))
