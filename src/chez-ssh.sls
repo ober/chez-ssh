@@ -16,6 +16,7 @@
   (export
     ;; Key management
     ssh-agent-load-openssh-key   ;; (bv) → index or #f
+    ssh-agent-load-key-data      ;; (bv label) → index or #f (handles encrypted, prompts on /dev/tty)
     ssh-agent-load-key-file      ;; (path) → index or #f (auto-prompts for encrypted keys)
     ssh-agent-load-ed25519-seed  ;; (seed-bv comment) → index or #f
     ssh-key-encrypted?           ;; (bv) → #t / #f
@@ -129,6 +130,19 @@
   (define (ssh-key-encrypted? data)
     (let ([bv (if (string? data) (string->utf8 data) data)])
       (= (c-key-is-encrypted bv (bytevector-length bv)) 1)))
+
+  ;; Load key from raw data (bytevector or string), prompts for passphrase if encrypted
+  (define (ssh-agent-load-key-data data label)
+    (let ([bv (if (string? data) (string->utf8 data) data)])
+      (cond
+        [(= (c-key-is-encrypted bv (bytevector-length bv)) 1)
+         (let ([idx (c-load-key-prompted
+                      bv (bytevector-length bv)
+                      (string-append "Enter passphrase for " (or label "key") ": "))])
+           (if (>= idx 0) idx #f))]
+        [else
+         (let ([idx (c-load-openssh-key bv (bytevector-length bv))])
+           (if (>= idx 0) idx #f))])))
 
   (define (ssh-agent-load-key-file path)
     (let ([expanded (if (and (> (string-length path) 0)
