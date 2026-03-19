@@ -28,7 +28,18 @@
 #include <signal.h>
 #include <errno.h>
 #include <poll.h>
+#include <termios.h>
+#include <fcntl.h>
+#include "bcrypt_pbkdf.h"
+#ifndef CHEZ_SSH_NO_OPENSSL
 #include <openssl/evp.h>
+#else
+/* Standalone ed25519 — defined in ed25519-standalone.c */
+int ed25519_sign_standalone(const uint8_t *seed,
+                             const uint8_t *data, size_t datalen,
+                             uint8_t *sig_out);
+int ed25519_derive_pubkey_standalone(const uint8_t *seed, uint8_t *pubkey_out);
+#endif
 
 /* ========== Constants ========== */
 
@@ -174,98 +185,189 @@ static const char OPENSSH_MAGIC[] = "openssh-key-v1\0";
 #define OPENSSH_MAGIC_LEN 15
 
 /*
- * parse_openssh_key — Parse an OpenSSH private key file.
+ * AES-256-CTR decryption — used to decrypt OpenSSH encrypted private keys.
+ * OpenSSL path uses EVP, standalone path uses a minimal AES implementation.
+ */
+#ifndef CHEZ_SSH_NO_OPENSSL
+static int aes256_ctr_decrypt(const uint8_t *key, const uint8_t *iv,
+                               const uint8_t *input, size_t len,
+                               uint8_t *output) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int outl = 0, outl2 = 0;
+    int rc = -1;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv) == 1 &&
+        EVP_DecryptUpdate(ctx, output, &outl, input, (int)len) == 1 &&
+        EVP_DecryptFinal_ex(ctx, output + outl, &outl2) == 1) {
+        rc = 0;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    return rc;
+}
+#else
+/* ========== Standalone AES-256-CTR ========== */
+
+static const uint8_t AES_SBOX[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+};
+
+static const uint8_t AES_RCON[11] = {
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
+};
+
+/* Multiply by 2 in GF(2^8) */
+static uint8_t xtime(uint8_t x) {
+    return (uint8_t)((x << 1) ^ (((x >> 7) & 1) * 0x1b));
+}
+
+/* AES-256 key expansion: 32-byte key → 240-byte round keys (15 rounds) */
+static void aes256_expand_key(const uint8_t *key, uint8_t rk[240]) {
+    int i;
+    memcpy(rk, key, 32);
+    for (i = 8; i < 60; i++) {
+        uint8_t tmp[4];
+        memcpy(tmp, rk + 4*(i-1), 4);
+        if (i % 8 == 0) {
+            uint8_t t = tmp[0];
+            tmp[0] = AES_SBOX[tmp[1]] ^ AES_RCON[i/8];
+            tmp[1] = AES_SBOX[tmp[2]];
+            tmp[2] = AES_SBOX[tmp[3]];
+            tmp[3] = AES_SBOX[t];
+        } else if (i % 8 == 4) {
+            tmp[0] = AES_SBOX[tmp[0]];
+            tmp[1] = AES_SBOX[tmp[1]];
+            tmp[2] = AES_SBOX[tmp[2]];
+            tmp[3] = AES_SBOX[tmp[3]];
+        }
+        rk[4*i+0] = rk[4*(i-8)+0] ^ tmp[0];
+        rk[4*i+1] = rk[4*(i-8)+1] ^ tmp[1];
+        rk[4*i+2] = rk[4*(i-8)+2] ^ tmp[2];
+        rk[4*i+3] = rk[4*(i-8)+3] ^ tmp[3];
+    }
+}
+
+/* AES single block encrypt (for CTR mode) */
+static void aes256_encrypt_block(const uint8_t rk[240], const uint8_t in[16], uint8_t out[16]) {
+    uint8_t s[16];
+    int i, r;
+    memcpy(s, in, 16);
+
+    /* AddRoundKey(0) */
+    for (i = 0; i < 16; i++) s[i] ^= rk[i];
+
+    for (r = 1; r < 14; r++) {
+        uint8_t t[16];
+        /* SubBytes */
+        for (i = 0; i < 16; i++) t[i] = AES_SBOX[s[i]];
+        /* ShiftRows */
+        s[0]=t[0]; s[1]=t[5]; s[2]=t[10]; s[3]=t[15];
+        s[4]=t[4]; s[5]=t[9]; s[6]=t[14]; s[7]=t[3];
+        s[8]=t[8]; s[9]=t[13]; s[10]=t[2]; s[11]=t[7];
+        s[12]=t[12]; s[13]=t[1]; s[14]=t[6]; s[15]=t[11];
+        /* MixColumns */
+        for (i = 0; i < 16; i += 4) {
+            uint8_t a0=s[i], a1=s[i+1], a2=s[i+2], a3=s[i+3];
+            s[i]   = xtime(a0)^xtime(a1)^a1^a2^a3;
+            s[i+1] = a0^xtime(a1)^xtime(a2)^a2^a3;
+            s[i+2] = a0^a1^xtime(a2)^xtime(a3)^a3;
+            s[i+3] = xtime(a0)^a0^a1^a2^xtime(a3);
+        }
+        /* AddRoundKey */
+        for (i = 0; i < 16; i++) s[i] ^= rk[r*16+i];
+    }
+
+    /* Final round (no MixColumns) */
+    {
+        uint8_t t[16];
+        for (i = 0; i < 16; i++) t[i] = AES_SBOX[s[i]];
+        s[0]=t[0]; s[1]=t[5]; s[2]=t[10]; s[3]=t[15];
+        s[4]=t[4]; s[5]=t[9]; s[6]=t[14]; s[7]=t[3];
+        s[8]=t[8]; s[9]=t[13]; s[10]=t[2]; s[11]=t[7];
+        s[12]=t[12]; s[13]=t[1]; s[14]=t[6]; s[15]=t[11];
+        for (i = 0; i < 16; i++) s[i] ^= rk[14*16+i];
+    }
+
+    memcpy(out, s, 16);
+}
+
+static int aes256_ctr_decrypt(const uint8_t *key, const uint8_t *iv,
+                               const uint8_t *input, size_t len,
+                               uint8_t *output) {
+    uint8_t rk[240];
+    uint8_t counter[16], keystream[16];
+    size_t i, j;
+
+    aes256_expand_key(key, rk);
+    memcpy(counter, iv, 16);
+
+    for (i = 0; i < len; i += 16) {
+        aes256_encrypt_block(rk, counter, keystream);
+        size_t block_len = (len - i < 16) ? (len - i) : 16;
+        for (j = 0; j < block_len; j++)
+            output[i + j] = input[i + j] ^ keystream[j];
+        /* Increment counter (big-endian) */
+        for (j = 15; j < 16; j--) {
+            if (++counter[j] != 0) break;
+        }
+    }
+
+    explicit_bzero(rk, sizeof(rk));
+    explicit_bzero(keystream, sizeof(keystream));
+    return 0;
+}
+#endif /* CHEZ_SSH_NO_OPENSSL */
+
+/*
+ * parse_openssh_key_private — Parse the decrypted private section.
  *
- * Extracts Ed25519 seed (32 bytes), public key (32 bytes), and comment
- * from the -----BEGIN OPENSSH PRIVATE KEY----- format.
- *
- * Only supports unencrypted Ed25519 keys (cipher "none").
+ * Extracts Ed25519 seed, public key, and comment from the inner
+ * private section (after decryption if encrypted).
  * Returns 0 on success, -1 on error.
  */
-static int parse_openssh_key(const uint8_t *data, size_t len,
-                             uint8_t *seed_out, uint8_t *pubkey_out,
-                             char *comment_out, size_t comment_max) {
-    /* Find base64 payload between BEGIN/END markers */
-    const char *begin_marker = "-----BEGIN OPENSSH PRIVATE KEY-----";
-    const char *end_marker = "-----END OPENSSH PRIVATE KEY-----";
-    /* Ensure data is null-terminated within len for strstr */
-    (void)len;
-    const char *begin = strstr((const char *)data, begin_marker);
-    if (!begin) return -1;
-    begin += strlen(begin_marker);
-    const char *end = strstr(begin, end_marker);
-    if (!end) return -1;
-
-    /* Base64 decode */
-    size_t b64len = end - begin;
-    size_t maxdec = (b64len * 3) / 4 + 4;
-    uint8_t *dec = calloc(1, maxdec);
-    if (!dec) return -1;
-    int declen = base64_decode((const uint8_t *)begin, b64len, dec, maxdec);
-    if (declen < 0) { free(dec); return -1; }
-
-    size_t pos = 0;
-
-    /* Verify magic */
-    if ((size_t)declen < OPENSSH_MAGIC_LEN ||
-        memcmp(dec, OPENSSH_MAGIC, OPENSSH_MAGIC_LEN) != 0) {
-        free(dec); return -1;
-    }
-    pos = OPENSSH_MAGIC_LEN;
-
-    /* Read cipher, kdf, kdfoptions */
-    const uint8_t *sdata;
-    uint32_t slen;
-    if (read_string(dec, declen, &pos, &sdata, &slen) < 0) { free(dec); return -1; }
-    /* cipher must be "none" */
-    if (slen != 4 || memcmp(sdata, "none", 4) != 0) {
-        /* Encrypted key — not supported (embed layer handles encryption) */
-        free(dec); return -1;
-    }
-    if (read_string(dec, declen, &pos, &sdata, &slen) < 0) { free(dec); return -1; } /* kdf */
-    if (read_string(dec, declen, &pos, &sdata, &slen) < 0) { free(dec); return -1; } /* kdfoptions */
-
-    /* Number of keys */
-    uint32_t nkeys;
-    if (read_uint32(dec, declen, &pos, &nkeys) < 0 || nkeys < 1) { free(dec); return -1; }
-
-    /* Skip public key blob */
-    if (read_string(dec, declen, &pos, &sdata, &slen) < 0) { free(dec); return -1; }
-
-    /* Read private section */
-    const uint8_t *priv_section;
-    uint32_t priv_len;
-    if (read_string(dec, declen, &pos, &priv_section, &priv_len) < 0) { free(dec); return -1; }
-
-    /* Parse private section */
+static int parse_openssh_key_private(const uint8_t *priv_section, uint32_t priv_len,
+                                      uint8_t *seed_out, uint8_t *pubkey_out,
+                                      char *comment_out, size_t comment_max) {
     size_t ppos = 0;
 
-    /* Check integers (must match) */
+    /* Check integers (must match — validates correct decryption) */
     uint32_t check1, check2;
-    if (read_uint32(priv_section, priv_len, &ppos, &check1) < 0) { free(dec); return -1; }
-    if (read_uint32(priv_section, priv_len, &ppos, &check2) < 0) { free(dec); return -1; }
-    if (check1 != check2) { free(dec); return -1; }
+    if (read_uint32(priv_section, priv_len, &ppos, &check1) < 0) return -1;
+    if (read_uint32(priv_section, priv_len, &ppos, &check2) < 0) return -1;
+    if (check1 != check2) return -1;  /* wrong passphrase */
 
     /* Key type — must be "ssh-ed25519" */
     const uint8_t *keytype;
     uint32_t keytype_len;
-    if (read_string(priv_section, priv_len, &ppos, &keytype, &keytype_len) < 0) { free(dec); return -1; }
-    if (keytype_len != 11 || memcmp(keytype, "ssh-ed25519", 11) != 0) {
-        free(dec); return -1;
-    }
+    if (read_string(priv_section, priv_len, &ppos, &keytype, &keytype_len) < 0) return -1;
+    if (keytype_len != 11 || memcmp(keytype, "ssh-ed25519", 11) != 0) return -1;
 
     /* Public key (32 bytes) */
     const uint8_t *pk;
     uint32_t pk_len;
-    if (read_string(priv_section, priv_len, &ppos, &pk, &pk_len) < 0) { free(dec); return -1; }
-    if (pk_len != 32) { free(dec); return -1; }
+    if (read_string(priv_section, priv_len, &ppos, &pk, &pk_len) < 0) return -1;
+    if (pk_len != 32) return -1;
     memcpy(pubkey_out, pk, 32);
 
     /* Private key (64 bytes: seed[32] || pubkey[32]) */
     const uint8_t *sk;
     uint32_t sk_len;
-    if (read_string(priv_section, priv_len, &ppos, &sk, &sk_len) < 0) { free(dec); return -1; }
-    if (sk_len != 64) { free(dec); return -1; }
+    if (read_string(priv_section, priv_len, &ppos, &sk, &sk_len) < 0) return -1;
+    if (sk_len != 64) return -1;
     memcpy(seed_out, sk, 32);  /* first 32 bytes are the seed */
 
     /* Comment */
@@ -279,16 +381,215 @@ static int parse_openssh_key(const uint8_t *data, size_t len,
         comment_out[clen] = '\0';
     }
 
-    /* Zero the decoded buffer (contained the raw private key) */
-    explicit_bzero(dec, maxdec);
-    free(dec);
     return 0;
 }
 
-/* ========== Ed25519 Signing (via OpenSSL) ========== */
+/*
+ * parse_openssh_key_header — Decode and parse the OpenSSH key header.
+ *
+ * Returns a malloc'd decoded buffer (caller must free), and fills in
+ * cipher info, KDF params, and a pointer to the private section.
+ * Returns NULL on error.
+ */
+static uint8_t *parse_openssh_key_header(const uint8_t *data, size_t len,
+                                          char *cipher_out, size_t cipher_max,
+                                          char *kdf_out, size_t kdf_max,
+                                          const uint8_t **kdf_opts_out, uint32_t *kdf_opts_len,
+                                          const uint8_t **priv_out, uint32_t *priv_len_out,
+                                          int *declen_out) {
+    const char *begin_marker = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    const char *end_marker = "-----END OPENSSH PRIVATE KEY-----";
+    (void)len;
+    const char *begin = strstr((const char *)data, begin_marker);
+    if (!begin) return NULL;
+    begin += strlen(begin_marker);
+    const char *end = strstr(begin, end_marker);
+    if (!end) return NULL;
+
+    size_t b64len = end - begin;
+    size_t maxdec = (b64len * 3) / 4 + 4;
+    uint8_t *dec = calloc(1, maxdec);
+    if (!dec) return NULL;
+    int declen = base64_decode((const uint8_t *)begin, b64len, dec, maxdec);
+    if (declen < 0) { free(dec); return NULL; }
+    *declen_out = declen;
+
+    size_t pos = 0;
+
+    /* Verify magic */
+    if ((size_t)declen < OPENSSH_MAGIC_LEN ||
+        memcmp(dec, OPENSSH_MAGIC, OPENSSH_MAGIC_LEN) != 0) {
+        free(dec); return NULL;
+    }
+    pos = OPENSSH_MAGIC_LEN;
+
+    /* Read cipher name */
+    const uint8_t *sdata;
+    uint32_t slen;
+    if (read_string(dec, declen, &pos, &sdata, &slen) < 0) { free(dec); return NULL; }
+    {
+        size_t clen = slen < cipher_max - 1 ? slen : cipher_max - 1;
+        memcpy(cipher_out, sdata, clen);
+        cipher_out[clen] = '\0';
+    }
+
+    /* Read KDF name */
+    if (read_string(dec, declen, &pos, &sdata, &slen) < 0) { free(dec); return NULL; }
+    {
+        size_t clen = slen < kdf_max - 1 ? slen : kdf_max - 1;
+        memcpy(kdf_out, sdata, clen);
+        kdf_out[clen] = '\0';
+    }
+
+    /* Read KDF options */
+    if (read_string(dec, declen, &pos, kdf_opts_out, kdf_opts_len) < 0) { free(dec); return NULL; }
+
+    /* Number of keys */
+    uint32_t nkeys;
+    if (read_uint32(dec, declen, &pos, &nkeys) < 0 || nkeys < 1) { free(dec); return NULL; }
+
+    /* Skip public key blob */
+    if (read_string(dec, declen, &pos, &sdata, &slen) < 0) { free(dec); return NULL; }
+
+    /* Private section */
+    if (read_string(dec, declen, &pos, priv_out, priv_len_out) < 0) { free(dec); return NULL; }
+
+    return dec;
+}
 
 /*
- * ed25519_sign — Sign data with an Ed25519 seed. Key stays in C.
+ * parse_openssh_key — Parse an unencrypted OpenSSH private key.
+ * Backward compatible: only supports cipher "none".
+ * Returns 0 on success, -1 on error.
+ */
+static int parse_openssh_key(const uint8_t *data, size_t len,
+                             uint8_t *seed_out, uint8_t *pubkey_out,
+                             char *comment_out, size_t comment_max) {
+    char cipher[64], kdf[64];
+    const uint8_t *kdf_opts, *priv_section;
+    uint32_t kdf_opts_len, priv_len;
+    int declen;
+
+    uint8_t *dec = parse_openssh_key_header(data, len, cipher, sizeof(cipher),
+                                             kdf, sizeof(kdf),
+                                             &kdf_opts, &kdf_opts_len,
+                                             &priv_section, &priv_len, &declen);
+    if (!dec) return -1;
+
+    /* Must be unencrypted */
+    if (strcmp(cipher, "none") != 0) {
+        explicit_bzero(dec, declen);
+        free(dec);
+        return -1;
+    }
+
+    int rc = parse_openssh_key_private(priv_section, priv_len,
+                                        seed_out, pubkey_out,
+                                        comment_out, comment_max);
+    explicit_bzero(dec, declen);
+    free(dec);
+    return rc;
+}
+
+/*
+ * parse_openssh_key_encrypted — Parse an encrypted OpenSSH private key.
+ *
+ * Supports cipher "aes256-ctr" with KDF "bcrypt".
+ * Returns 0 on success, -1 on error (wrong passphrase, unsupported cipher, etc.).
+ */
+static int parse_openssh_key_encrypted(const uint8_t *data, size_t len,
+                                        const char *passphrase, size_t passlen,
+                                        uint8_t *seed_out, uint8_t *pubkey_out,
+                                        char *comment_out, size_t comment_max) {
+    char cipher[64], kdf[64];
+    const uint8_t *kdf_opts, *priv_section;
+    uint32_t kdf_opts_len, priv_len;
+    int declen;
+
+    uint8_t *dec = parse_openssh_key_header(data, len, cipher, sizeof(cipher),
+                                             kdf, sizeof(kdf),
+                                             &kdf_opts, &kdf_opts_len,
+                                             &priv_section, &priv_len, &declen);
+    if (!dec) return -1;
+
+    /* If not encrypted, just parse directly */
+    if (strcmp(cipher, "none") == 0) {
+        int rc = parse_openssh_key_private(priv_section, priv_len,
+                                            seed_out, pubkey_out,
+                                            comment_out, comment_max);
+        explicit_bzero(dec, declen);
+        free(dec);
+        return rc;
+    }
+
+    /* Must be aes256-ctr with bcrypt KDF */
+    if (strcmp(cipher, "aes256-ctr") != 0 || strcmp(kdf, "bcrypt") != 0) {
+        explicit_bzero(dec, declen);
+        free(dec);
+        return -1;
+    }
+
+    /* Parse KDF options: string(salt) || uint32(rounds) */
+    const uint8_t *salt;
+    uint32_t salt_len, rounds;
+    size_t kpos = 0;
+    if (read_string(kdf_opts, kdf_opts_len, &kpos, &salt, &salt_len) < 0) {
+        explicit_bzero(dec, declen);
+        free(dec);
+        return -1;
+    }
+    if (read_uint32(kdf_opts, kdf_opts_len, &kpos, &rounds) < 0) {
+        explicit_bzero(dec, declen);
+        free(dec);
+        return -1;
+    }
+
+    /* Derive key material: 32 bytes AES key + 16 bytes IV = 48 bytes */
+    uint8_t derived[48];
+    if (bcrypt_pbkdf(passphrase, passlen, salt, salt_len, rounds,
+                     derived, sizeof(derived)) < 0) {
+        explicit_bzero(dec, declen);
+        free(dec);
+        return -1;
+    }
+
+    /* Decrypt the private section */
+    uint8_t *decrypted = calloc(1, priv_len);
+    if (!decrypted) {
+        explicit_bzero(derived, sizeof(derived));
+        explicit_bzero(dec, declen);
+        free(dec);
+        return -1;
+    }
+
+    if (aes256_ctr_decrypt(derived, derived + 32, priv_section, priv_len, decrypted) < 0) {
+        explicit_bzero(derived, sizeof(derived));
+        explicit_bzero(decrypted, priv_len);
+        free(decrypted);
+        explicit_bzero(dec, declen);
+        free(dec);
+        return -1;
+    }
+
+    explicit_bzero(derived, sizeof(derived));
+
+    /* Parse the decrypted private section */
+    int rc = parse_openssh_key_private(decrypted, priv_len,
+                                        seed_out, pubkey_out,
+                                        comment_out, comment_max);
+
+    explicit_bzero(decrypted, priv_len);
+    free(decrypted);
+    explicit_bzero(dec, declen);
+    free(dec);
+    return rc;
+}
+
+/* ========== Ed25519 Signing ========== */
+
+#ifndef CHEZ_SSH_NO_OPENSSL
+/*
+ * ed25519_sign — Sign data with an Ed25519 seed (OpenSSL backend).
  * Returns 0 on success, -1 on error.
  */
 static int ed25519_sign(const uint8_t *seed,
@@ -314,7 +615,7 @@ static int ed25519_sign(const uint8_t *seed,
 }
 
 /*
- * ed25519_derive_pubkey — Derive public key from seed via OpenSSL.
+ * ed25519_derive_pubkey — Derive public key from seed (OpenSSL backend).
  * Returns 0 on success, -1 on error.
  */
 static int ed25519_derive_pubkey(const uint8_t *seed, uint8_t *pubkey_out) {
@@ -327,6 +628,17 @@ static int ed25519_derive_pubkey(const uint8_t *seed, uint8_t *pubkey_out) {
     EVP_PKEY_free(pkey);
     return rc;
 }
+#else
+/* Standalone backend — no OpenSSL dependency */
+static int ed25519_sign(const uint8_t *seed,
+                        const uint8_t *data, size_t datalen,
+                        uint8_t *sig_out) {
+    return ed25519_sign_standalone(seed, data, datalen, sig_out);
+}
+static int ed25519_derive_pubkey(const uint8_t *seed, uint8_t *pubkey_out) {
+    return ed25519_derive_pubkey_standalone(seed, pubkey_out);
+}
+#endif
 
 /* ========== Key Management ========== */
 
@@ -360,6 +672,122 @@ int chez_ssh_agent_load_openssh_key(const uint8_t *data, int len) {
 
     k->active = 1;
     _key_count++;
+    return idx;
+}
+
+/*
+ * chez_ssh_key_is_encrypted — Check if an OpenSSH key file is encrypted.
+ * Returns: 1 = encrypted, 0 = unencrypted, -1 = not a valid OpenSSH key.
+ */
+int chez_ssh_key_is_encrypted(const uint8_t *data, int len) {
+    char cipher[64], kdf[64];
+    const uint8_t *kdf_opts, *priv_section;
+    uint32_t kdf_opts_len, priv_len;
+    int declen;
+
+    uint8_t *dec = parse_openssh_key_header(data, len, cipher, sizeof(cipher),
+                                             kdf, sizeof(kdf),
+                                             &kdf_opts, &kdf_opts_len,
+                                             &priv_section, &priv_len, &declen);
+    if (!dec) return -1;
+    int encrypted = strcmp(cipher, "none") != 0 ? 1 : 0;
+    free(dec);
+    return encrypted;
+}
+
+/*
+ * chez_ssh_agent_load_openssh_key_with_pass — Load an encrypted OpenSSH key
+ * with an explicit passphrase.
+ *
+ * Also works for unencrypted keys (passphrase ignored).
+ * Returns key index on success, -1 on error.
+ */
+int chez_ssh_agent_load_openssh_key_with_pass(const uint8_t *data, int len,
+                                               const char *pass, int passlen) {
+    if (_key_count >= MAX_KEYS) return -1;
+
+    harden_keys();
+
+    int idx = _key_count;
+    ssh_key_t *k = &_keys[idx];
+    memset(k, 0, sizeof(*k));
+
+    if (parse_openssh_key_encrypted(data, len, pass, passlen,
+                                     k->seed, k->pubkey,
+                                     k->comment, MAX_COMMENT) < 0) {
+        explicit_bzero(k, sizeof(*k));
+        return -1;
+    }
+
+    k->active = 1;
+    _key_count++;
+    return idx;
+}
+
+/*
+ * chez_ssh_agent_load_key_prompted — Load an OpenSSH key, prompting for
+ * passphrase on /dev/tty if encrypted.
+ *
+ * The passphrase never enters Scheme memory — it stays on the C stack
+ * and is zeroed immediately after use.
+ *
+ * Returns key index on success, -1 on error.
+ */
+int chez_ssh_agent_load_key_prompted(const uint8_t *data, int len,
+                                      const char *prompt) {
+    /* First check if the key is encrypted */
+    int encrypted = chez_ssh_key_is_encrypted(data, len);
+    if (encrypted < 0) return -1;
+
+    if (!encrypted) {
+        /* Unencrypted — load directly */
+        return chez_ssh_agent_load_openssh_key(data, len);
+    }
+
+    /* Read passphrase from /dev/tty */
+    int tty_fd = open("/dev/tty", O_RDWR);
+    if (tty_fd < 0) return -1;
+
+    /* Disable echo */
+    struct termios old_term, new_term;
+    if (tcgetattr(tty_fd, &old_term) < 0) {
+        close(tty_fd);
+        return -1;
+    }
+    new_term = old_term;
+    new_term.c_lflag &= ~(ECHO | ECHONL);
+    tcsetattr(tty_fd, TCSANOW, &new_term);
+
+    /* Write prompt */
+    if (prompt && prompt[0]) {
+        ssize_t r;
+        size_t plen = strlen(prompt);
+        do { r = write(tty_fd, prompt, plen); } while (r < 0 && errno == EINTR);
+    }
+
+    /* Read passphrase (up to 1024 bytes) */
+    char passbuf[1024];
+    int passlen = 0;
+    for (;;) {
+        ssize_t r = read(tty_fd, passbuf + passlen, 1);
+        if (r <= 0) break;
+        if (passbuf[passlen] == '\n' || passbuf[passlen] == '\r') break;
+        passlen++;
+        if (passlen >= (int)sizeof(passbuf) - 1) break;
+    }
+    passbuf[passlen] = '\0';
+
+    /* Restore echo, write newline */
+    tcsetattr(tty_fd, TCSANOW, &old_term);
+    { ssize_t r; do { r = write(tty_fd, "\n", 1); } while (r < 0 && errno == EINTR); }
+    close(tty_fd);
+
+    /* Load the key with the passphrase */
+    int idx = chez_ssh_agent_load_openssh_key_with_pass(data, len, passbuf, passlen);
+
+    /* Zero the passphrase immediately */
+    explicit_bzero(passbuf, sizeof(passbuf));
+
     return idx;
 }
 

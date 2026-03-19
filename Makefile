@@ -7,8 +7,8 @@ SCHEME = scheme
 
 all: chez_ssh_shim.so
 
-chez_ssh_shim.so: chez_ssh_shim.c
-	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+chez_ssh_shim.so: chez_ssh_shim.c bcrypt_pbkdf.c bcrypt_pbkdf.h
+	$(CC) $(CFLAGS) -o $@ chez_ssh_shim.c bcrypt_pbkdf.c $(LIBS)
 
 test: chez_ssh_shim.so
 	LD_LIBRARY_PATH=. $(SCHEME) --libdirs src --script tests/ssh-test.ss

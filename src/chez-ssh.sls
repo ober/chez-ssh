@@ -16,8 +16,9 @@
   (export
     ;; Key management
     ssh-agent-load-openssh-key   ;; (bv) → index or #f
-    ssh-agent-load-key-file      ;; (path) → index or #f
+    ssh-agent-load-key-file      ;; (path) → index or #f (auto-prompts for encrypted keys)
     ssh-agent-load-ed25519-seed  ;; (seed-bv comment) → index or #f
+    ssh-key-encrypted?           ;; (bv) → #t / #f
     ssh-agent-key-count          ;; () → int
     ssh-agent-key-info           ;; (index) → (comment . pubkey-hex) or #f
     ssh-agent-list-keys          ;; () → list of (index comment pubkey-hex)
@@ -53,6 +54,15 @@
 
   (define c-load-openssh-key
     (foreign-procedure "chez_ssh_agent_load_openssh_key" (u8* int) int))
+
+  (define c-key-is-encrypted
+    (foreign-procedure "chez_ssh_key_is_encrypted" (u8* int) int))
+
+  (define c-load-key-with-pass
+    (foreign-procedure "chez_ssh_agent_load_openssh_key_with_pass" (u8* int string int) int))
+
+  (define c-load-key-prompted
+    (foreign-procedure "chez_ssh_agent_load_key_prompted" (u8* int string) int))
 
   (define c-load-ed25519
     (foreign-procedure "chez_ssh_agent_load_ed25519" (u8* string) int))
@@ -116,6 +126,10 @@
       (let ([idx (c-load-openssh-key bv (bytevector-length bv))])
         (if (>= idx 0) idx #f))))
 
+  (define (ssh-key-encrypted? data)
+    (let ([bv (if (string? data) (string->utf8 data) data)])
+      (= (c-key-is-encrypted bv (bytevector-length bv)) 1)))
+
   (define (ssh-agent-load-key-file path)
     (let ([expanded (if (and (> (string-length path) 0)
                              (char=? (string-ref path 0) #\~))
@@ -126,9 +140,16 @@
         (let* ([port (open-file-input-port expanded)]
                [data (get-bytevector-all port)])
           (close-port port)
-          (if (eof-object? data)
-            #f
-            (ssh-agent-load-openssh-key data))))))
+          (cond
+            [(eof-object? data) #f]
+            [(= (c-key-is-encrypted data (bytevector-length data)) 1)
+             ;; Encrypted key — prompt for passphrase on /dev/tty
+             (let ([idx (c-load-key-prompted
+                          data (bytevector-length data)
+                          (string-append "Enter passphrase for " path ": "))])
+               (if (>= idx 0) idx #f))]
+            [else
+             (ssh-agent-load-openssh-key data)])))))
 
   (define (ssh-agent-load-ed25519-seed seed comment)
     (let ([idx (c-load-ed25519 seed (or comment ""))])
