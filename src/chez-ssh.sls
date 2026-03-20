@@ -1,20 +1,24 @@
 #!chezscheme
-;;; chez-ssh — SSH agent for Chez Scheme
+;;; chez-ssh — SSH agent + client for Chez Scheme
 ;;;
-;;; Implements the SSH agent protocol with Ed25519 support.
-;;; Private keys are stored in mlock'd C memory and never enter
-;;; the Scheme heap. Signing happens entirely in C via OpenSSL.
+;;; Implements the SSH agent protocol with Ed25519 support,
+;;; plus a full SSH client (connect, exec, SFTP, port forwarding).
 ;;;
-;;; Usage:
+;;; Agent usage:
 ;;;   (import (chez-ssh))
 ;;;   (ssh-agent-load-key-file "~/.ssh/id_ed25519")
-;;;   (ssh-agent-start)  ;; starts socket, sets SSH_AUTH_SOCK
-;;;   ;; ... ssh, git, etc. now use this agent ...
+;;;   (ssh-agent-start)
 ;;;   (ssh-agent-stop)
+;;;
+;;; Client usage:
+;;;   (import (chez-ssh))
+;;;   (let ([conn (ssh-connect "example.com" 22 "user" "~/.ssh/id_ed25519")])
+;;;     (ssh-run conn "uname -a")  ;; → (0 . "Linux ...")
+;;;     (ssh-disconnect conn))
 
 (library (chez-ssh)
   (export
-    ;; Key management
+    ;; Key management (agent)
     ssh-agent-load-openssh-key   ;; (bv) → index or #f
     ssh-agent-load-key-data      ;; (bv label) → index or #f (handles encrypted, prompts on /dev/tty)
     ssh-agent-load-key-file      ;; (path) → index or #f (auto-prompts for encrypted keys)
@@ -31,9 +35,33 @@
     ssh-agent-stop               ;; () → void
     ssh-agent-running?           ;; () → boolean
     ssh-agent-socket-path        ;; () → string or #f
+
+    ;; SSH client — connection
+    ssh-connect                  ;; (host #:port #:user #:key-file #:password) → connection
+    ssh-disconnect               ;; (conn) → void
+    ssh-connection?
+
+    ;; SSH client — command execution
+    ssh-run                      ;; (conn command) → (exit-status . output)
+    ssh-capture                  ;; (conn command) → output-string
+
+    ;; SSH client — channels
+    ssh-exec                     ;; (conn command) → channel
+    ssh-shell                    ;; (conn) → channel
+
+    ;; SSH client — SFTP
+    ssh-sftp                     ;; (conn) → sftp-session
+    ssh-sftp-close               ;; (conn sftp) → void
+    ssh-scp-get                  ;; (conn remote local) → void
+    ssh-scp-put                  ;; (conn local remote) → void
+
+    ;; SSH client — port forwarding
+    ssh-forward-local            ;; (conn local-port remote-host remote-port) → listener
+    ssh-forward-remote           ;; (conn remote-port) → allocated-port
     )
 
-  (import (chezscheme))
+  (import (chezscheme)
+          (ssh client))
 
   ;; Load the shared library
   (define _shim
