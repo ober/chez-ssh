@@ -80,7 +80,9 @@ static void harden_keys(void) {
     if (_keys_hardened) return;
     _keys_hardened = 1;
     mlock(_keys, sizeof(_keys));
+#ifdef MADV_DONTDUMP
     madvise(_keys, sizeof(_keys), MADV_DONTDUMP);
+#endif
 }
 
 /* ========== Socket State ========== */
@@ -835,6 +837,14 @@ int chez_ssh_agent_get_comment(int index, char *out, int max_out) {
     memcpy(out, _keys[index].comment, len);
     out[len] = '\0';
     return len;
+}
+
+/* Copy seed (private key material) into caller's buffer. Returns ED25519_SEED (32) or -1. */
+int chez_ssh_agent_get_seed(int index, uint8_t *out, int max_out) {
+    if (index < 0 || index >= _key_count || !_keys[index].active) return -1;
+    if (max_out < ED25519_SEED) return -1;
+    memcpy(out, _keys[index].seed, ED25519_SEED);
+    return ED25519_SEED;
 }
 
 void chez_ssh_agent_remove_key(int index) {
