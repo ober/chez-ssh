@@ -116,6 +116,8 @@
 
   (define c-get-socket-path
     (foreign-procedure "chez_ssh_agent_get_socket_path" () string))
+  (define c-get-agent-dir
+    (foreign-procedure "chez_ssh_agent_get_dir" () string))
 
   (define c-is-running
     (foreign-procedure "chez_ssh_agent_is_running" () int))
@@ -245,7 +247,16 @@
                  (putenv "SSH_AUTH_SOCK" path)))
              #t)
            (error 'ssh-agent-start
-                  "Failed to start SSH agent")))]))
+                  (string-append "Failed to start SSH agent ("
+                    (case rc
+                      [(-1) (string-append "mkdir failed: " (or (c-get-agent-dir) "?"))]
+                      [(-2) "socket() failed"]
+                      [(-3) (string-append "bind() failed: " (or (c-get-agent-dir) "?"))]
+                      [(-4) "listen() failed"]
+                      [(-5) "pipe() failed"]
+                      [(-6) "pthread_create() failed"]
+                      [else (string-append "error code " (number->string rc))])
+                    ")"))))]))
 
   (define (ssh-agent-stop)
     (c-stop)

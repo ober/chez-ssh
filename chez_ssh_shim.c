@@ -1110,20 +1110,33 @@ static void *agent_thread_fn(void *arg) {
     return NULL;
 }
 
+/* Error codes for chez_ssh_agent_start:
+ *  0 = success, -1 = mkdir, -2 = socket, -3 = bind,
+ * -4 = listen, -5 = pipe, -6 = pthread_create */
 int chez_ssh_agent_start(const char *socket_dir) {
     if (_agent_running) return 0;  /* already running */
 
-    /* Determine socket directory */
+    /* Determine socket directory — try multiple locations */
     const char *dir = socket_dir;
     if (!dir || dir[0] == '\0') {
         dir = getenv("XDG_RUNTIME_DIR");
+        if (!dir) dir = getenv("TMPDIR");
         if (!dir) dir = "/tmp";
     }
 
     /* Create agent-specific subdirectory: <dir>/jsh-agent-<pid>/ */
     pid_t pid = getpid();
     snprintf(_agent_dir, sizeof(_agent_dir), "%s/jsh-agent-%d", dir, pid);
-    if (mkdir(_agent_dir, 0700) < 0 && errno != EEXIST) return -1;
+    if (mkdir(_agent_dir, 0700) < 0 && errno != EEXIST) {
+        /* Primary dir failed — try TMPDIR fallback */
+        const char *fallback = getenv("TMPDIR");
+        if (fallback && strcmp(fallback, dir) != 0) {
+            snprintf(_agent_dir, sizeof(_agent_dir), "%s/jsh-agent-%d", fallback, pid);
+            if (mkdir(_agent_dir, 0700) < 0 && errno != EEXIST) return -1;
+        } else {
+            return -1;
+        }
+    }
 
     /* Socket path: <dir>/jsh-agent-<pid>/agent.<pid> */
     snprintf(_agent_path, sizeof(_agent_path), "%s/agent.%d", _agent_dir, pid);
@@ -1133,7 +1146,7 @@ int chez_ssh_agent_start(const char *socket_dir) {
 
     /* Create Unix domain socket */
     _agent_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (_agent_fd < 0) return -1;
+    if (_agent_fd < 0) return -2;
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -1141,7 +1154,7 @@ int chez_ssh_agent_start(const char *socket_dir) {
     strncpy(addr.sun_path, _agent_path, sizeof(addr.sun_path) - 1);
 
     if (bind(_agent_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(_agent_fd); _agent_fd = -1; return -1;
+        close(_agent_fd); _agent_fd = -1; return -3;
     }
 
     /* Owner-only access */
@@ -1150,14 +1163,14 @@ int chez_ssh_agent_start(const char *socket_dir) {
     if (listen(_agent_fd, 8) < 0) {
         close(_agent_fd); _agent_fd = -1;
         unlink(_agent_path);
-        return -1;
+        return -4;
     }
 
     /* Create wakeup pipe for clean shutdown */
     if (pipe(_agent_wakeup_pipe) < 0) {
         close(_agent_fd); _agent_fd = -1;
         unlink(_agent_path);
-        return -1;
+        return -5;
     }
 
     /* Start accept thread */
@@ -1168,7 +1181,7 @@ int chez_ssh_agent_start(const char *socket_dir) {
         close(_agent_wakeup_pipe[0]); close(_agent_wakeup_pipe[1]);
         _agent_wakeup_pipe[0] = _agent_wakeup_pipe[1] = -1;
         unlink(_agent_path);
-        return -1;
+        return -6;
     }
 
     return 0;
@@ -1177,6 +1190,11 @@ int chez_ssh_agent_start(const char *socket_dir) {
 const char *chez_ssh_agent_get_socket_path(void) {
     if (!_agent_running) return NULL;
     return _agent_path;
+}
+
+/* Returns the last attempted agent directory (even on failure) */
+const char *chez_ssh_agent_get_dir(void) {
+    return _agent_dir;
 }
 
 int chez_ssh_agent_is_running(void) {
