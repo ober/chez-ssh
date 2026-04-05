@@ -31,6 +31,14 @@
 #include <termios.h>
 #include <fcntl.h>
 #include "bcrypt_pbkdf.h"
+
+/* macOS lacks explicit_bzero — use memset_s */
+#ifdef __APPLE__
+static void apple_explicit_bzero(void *buf, size_t len) {
+    memset_s(buf, len, 0, len);
+}
+#define explicit_bzero apple_explicit_bzero
+#endif
 #ifndef CHEZ_SSH_NO_OPENSSL
 #include <openssl/evp.h>
 #else
